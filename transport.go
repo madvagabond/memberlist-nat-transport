@@ -1,5 +1,4 @@
-package memberlist-nat-transport
-
+package memberlist_nat_transport
 
 import (
 	"github.com/anacrolix/utp"
@@ -7,7 +6,10 @@ import (
 	"net"
 	"time"
 	"github.com/ccding/go-stun/stun"
+	"context"
 	ma "github.com/multiformats/go-multiaddr"
+	
+
 )
 
 
@@ -23,17 +25,28 @@ type NatTransport struct {
 	streams chan net.Conn
 	utp utp.Socket
 	udp net.UDPConn
-	public_address ma.Multiaddr
-	shutdownCh chan struct{}
+	address ma.Multiaddr
+	ctx context.Context
 }
 
 
 
-func udpHolePunch(host string, port int) (net.UDPConn, stun.Host, error) {
-	conn, err := net.ListenUDP(host, port)
-	stun_client := stun.NewClientWithConnection(packet_conn)
-	host, err := stun_client.Keepalive()
-	return conn, host, err
+
+func NewNatTransport() {
+	
+}
+
+
+func (t *NatTransport) bind(s string) {
+}
+
+
+func udpHolePunch(host string, port int) (*net.UDPConn, *stun.Host, error) {
+	udp_addr, _ := net.ResolveUDPAddr("udp", host + ":" + string(port))
+	conn, err := net.ListenUDP("udp", udp_addr)
+	stun_client := stun.NewClientWithConnection(conn)
+	s_host, err := stun_client.Keepalive()
+	return conn, s_host, err
 }
 
 
@@ -48,6 +61,37 @@ func (t *NatTransport) PacketCh() <- chan *memberlist.Packet {
 }
 
 
+func (t *NatTransport) WriteTo(b []byte, addr string) (time.Time, error) {
+	maddr, e := ma.NewMultiaddr(addr)
+	ip, e := maddr.ValueForProtocol(ma.P_IP4)
+	port, e := maddr.ValueForProtocol(ma.P_UDP)
+
+	d_addr := ip + ":" + port
+	udp_addr, e := net.ResolveUDPAddr("udp", d_addr)
+	_, e = t.udp.WriteTo(b, udp_addr)
+	ts := time.Now()
+	return ts, e
+}
+
+
+func (t *NatTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
+	maddr, e := ma.NewMultiaddr(addr)
+	ip, e := maddr.ValueForProtocol(ma.P_IP4)
+
+	port, e := maddr.ValueForProtocol(ma.P_UDP)
+	addr = ip + ":" + port
+	ctx, _ := context.WithTimeout(context.Background(), timeout)
+
+	if e != nil {
+		var nc utp.Conn
+		return &nc, e 
+	}
+
+	
+	return utp.DialContext(ctx, addr)
+}
+
+
 
 func (t *NatTransport) udpListen() {
 	buf := make([]byte, packetBufSize)
@@ -56,15 +100,14 @@ func (t *NatTransport) udpListen() {
 		i, addr, e := t.udp.ReadFrom(buf)
 
 		//add logging 
-		if err != nil {
+		if e != nil {
 			break 
 		}
 
 		ts := time.Now()
 		
-		t.packets <- &Packet {
-			Address: addr, Buf: buf[:i], Timestamp: ts
-		}
+		t.packets <- &memberlist.Packet {
+			From: addr, Buf: buf[:i], Timestamp: ts}
 	}
 }
 
