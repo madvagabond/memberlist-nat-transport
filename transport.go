@@ -6,10 +6,11 @@ import (
 	"net"
 	"time"
 	"github.com/ccding/go-stun/stun"
+	ms "github.com/multiformats/go-multistream"
 	"context"
-	ma "github.com/multiformats/go-multiaddr"
-	
-
+	"io"
+	yamux "github.com/libp2p/go-yamux"
+	"errors"
 )
 
 
@@ -17,28 +18,29 @@ import (
 
 const (
 	packetBufSize = 65536
+	packet_proto = "/memberlist-nat/packet/v1"
+	stream_proto = "/member-list-nat/v1"
 )
 
 
 type NatTransport struct {
 	packets chan *memberlist.Packet
 	streams chan net.Conn
-	utp utp.Socket
-	udp net.UDPConn
-	address ma.Multiaddr
-	ctx context.Context
+
+	dialer dialer 
+	utp *utp.Socket
+	public_address string
 }
 
 
 
 
-func NewNatTransport() {
-	
-}
 
 
-func (t *NatTransport) bind(s string) {
-}
+
+
+
+
 
 
 func udpHolePunch(host string, port int) (*net.UDPConn, *stun.Host, error) {
@@ -52,6 +54,46 @@ func udpHolePunch(host string, port int) (*net.UDPConn, *stun.Host, error) {
 
 
 
+
+
+
+// port to config later
+func NewNatTransport(host string, port int) (*NatTransport, error) {
+	var t NatTransport
+	
+	pc, h, error := udpHolePunch(host, port)
+
+	if error != nil {
+		return &t, error
+	}
+
+
+	utp, err := utp.NewSocketFromPacketConn(pc)
+
+	if err != nil {
+		return &t, err
+	}
+
+
+
+
+	
+	t.packets = make(chan *memberlist.Packet, 10)
+	t.streams = make(chan net.Conn, 10)
+
+	t.public_address = net.JoinHostPort(h.IP(), string(h.Port()) ) 
+	t.utp = utp
+	t.dialer = newDialer()
+
+	go t.listen()
+
+	return &t, err 
+}
+
+
+
+
+
 func (t *NatTransport) StreamCh() <- chan net.Conn {
 	return t.streams
 }
@@ -61,76 +103,179 @@ func (t *NatTransport) PacketCh() <- chan *memberlist.Packet {
 }
 
 
-func (t *NatTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	maddr, e := ma.NewMultiaddr(addr)
-	ip, e := maddr.ValueForProtocol(ma.P_IP4)
-	port, e := maddr.ValueForProtocol(ma.P_UDP)
 
-	d_addr := ip + ":" + port
-	udp_addr, e := net.ResolveUDPAddr("udp", d_addr)
-	_, e = t.udp.WriteTo(b, udp_addr)
+
+
+func (t *NatTransport) WriteTo(b []byte, addr string) (time.Time, error) {
+	e := t.sendPacket(b, addr)
 	ts := time.Now()
 	return ts, e
 }
 
 
+
+/*
+Initiates a yamux over utp connection. 
+Then selects the packet protocol via yamux 
+sends the packet
+Closes the yamux stream. 
+*/
+
+func (t *NatTransport) sendPacket(b []byte, addr string) error {
+	conn, e := t.dialer.dial(addr)
+	stream := ms.NewMSSelect(conn, packet_proto)
+	_, e = stream.Write(b)
+	
+	stream.Close()
+	return e 	
+}
+
+
+
+
 func (t *NatTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	maddr, e := ma.NewMultiaddr(addr)
-	ip, e := maddr.ValueForProtocol(ma.P_IP4)
 
-	port, e := maddr.ValueForProtocol(ma.P_UDP)
-	addr = ip + ":" + port
-	ctx, _ := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	
 
-	if e != nil {
-		var nc utp.Conn
-		return &nc, e 
+
+
+	dial := func () (net.Conn, error){
+		conn, e := t.dialer.dial(addr)
+		e = ms.SelectProtoOrFail(stream_proto, conn)
+
+		if e != nil {
+			conn.Close()
+		}
+		
+		return conn, e
 	}
 
 	
-	return utp.DialContext(ctx, addr)
+	return ctx_helper(ctx, dial)	
 }
 
 
 
-func (t *NatTransport) udpListen() {
-	buf := make([]byte, packetBufSize)
 
-	for {
-		i, addr, e := t.udp.ReadFrom(buf)
 
-		//add logging 
-		if e != nil {
-			break 
-		}
 
-		ts := time.Now()
-		
-		t.packets <- &memberlist.Packet {
-			From: addr, Buf: buf[:i], Timestamp: ts}
+
+func (t *NatTransport) handlePacket(s string, rwc io.ReadWriteCloser) error {
+
+	defer rwc.Close()
+
+	conn, err := rwc.(net.Conn)
+
+	if !err {
+		return errors.New("type mismatch") 
 	}
+	
+	buf := make([]byte, packetBufSize)
+	i, e := conn.Read(buf)
+
+	if e != nil {
+		return e
+	}
+	
+	addr := conn.RemoteAddr()
+
+	ts := time.Now()
+
+	t.packets <- &memberlist.Packet{
+		From: addr,
+		Buf: buf[:i],
+		Timestamp: ts,
+	}
+
+	return nil
+
 }
 
 
-func (t *NatTransport) utpListen() {
 
+
+
+func (t *NatTransport) handleStream(proto string, rwc io.ReadWriteCloser) error {
+	conn, e := rwc.(net.Conn)
+
+
+	if !e {
+		return errors.New("type mismatch")
+	}
+
+	t.streams <- conn
+	return nil
+}
+
+
+
+
+
+
+
+func (t *NatTransport) streamListener(conn net.Conn) {
+	session, e := yamux.Server(conn, yamux.DefaultConfig())
+
+
+
+	if e != nil {
+		conn.Close()
+		return 
+	}
+
+
+
+	mux := ms.NewMultistreamMuxer()
+	mux.AddHandler(packet_proto, t.handlePacket)
+	mux.AddHandler(stream_proto, t.handleStream)
+
+	
+
+
+	
 	for {
-		conn, err := t.utp.Accept()
+
+
+		stream, err := session.Accept()
+
 
 		if err != nil {
-			break 
+			session.Close()
+			return 
 		}
 
-		t.streams <- conn
+		
+		//maybe implement error channel
+		go mux.Handle(stream) 
 	}
+
 }
 
 
 
+func (t *NatTransport) listen() error {
 
 
 
 
 
+	for {
+
+		conn, e := t.utp.Accept()
+
+		if e != nil {
+			return e 
+		}
+
+
+
+
+	
+		go t.streamListener(conn)
+	}
+	
+}
 
 
