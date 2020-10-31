@@ -1,4 +1,4 @@
-package memberlist_nat_transport
+package nat_transport
 
 import (
 	"github.com/anacrolix/utp"
@@ -8,6 +8,7 @@ import (
 	"github.com/ccding/go-stun/stun"
 	ms "github.com/multiformats/go-multistream"
 	"context"
+	"fmt"
 	"io"
 	yamux "github.com/libp2p/go-yamux"
 	"errors"
@@ -43,11 +44,13 @@ type NatTransport struct {
 
 
 
+
 func udpHolePunch(host string, port int) (*net.UDPConn, *stun.Host, error) {
 	udp_addr, _ := net.ResolveUDPAddr("udp", host + ":" + string(port))
 	conn, err := net.ListenUDP("udp", udp_addr)
 	stun_client := stun.NewClientWithConnection(conn)
-	s_host, err := stun_client.Keepalive()
+	stun_client.SetServerHost("stun.sipgate.net", 10000)
+	_, s_host, err := stun_client.Discover()
 	return conn, s_host, err
 }
 
@@ -81,7 +84,7 @@ func NewNatTransport(host string, port int) (*NatTransport, error) {
 	t.packets = make(chan *memberlist.Packet, 10)
 	t.streams = make(chan net.Conn, 10)
 
-	t.public_address = net.JoinHostPort(h.IP(), string(h.Port()) ) 
+	t.public_address = h.String()
 	t.utp = utp
 	t.dialer = newDialer()
 
@@ -105,6 +108,9 @@ func (t *NatTransport) PacketCh() <- chan *memberlist.Packet {
 
 
 
+func (t *NatTransport) Address() string {
+	return t.public_address
+}
 
 func (t *NatTransport) WriteTo(b []byte, addr string) (time.Time, error) {
 	e := t.sendPacket(b, addr)
@@ -140,20 +146,27 @@ func (t *NatTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn
 	
 
 
-
 	dial := func () (net.Conn, error){
+		
+
+
+
 		conn, e := t.dialer.dial(addr)
-		e = ms.SelectProtoOrFail(stream_proto, conn)
 
 		if e != nil {
 			conn.Close()
+			return conn, e
 		}
 		
-		return conn, e
+		err := ms.SelectProtoOrFail(stream_proto, conn)
+	
+	
+		return conn, err
 	}
 
-	
-	return ctx_helper(ctx, dial)	
+	//return dial()
+
+	return ctx_helper(ctx, dial)
 }
 
 
@@ -198,12 +211,10 @@ func (t *NatTransport) handlePacket(s string, rwc io.ReadWriteCloser) error {
 
 
 func (t *NatTransport) handleStream(proto string, rwc io.ReadWriteCloser) error {
-	conn, e := rwc.(net.Conn)
+	conn := rwc.(net.Conn)
 
+	fmt.Println("accepted stream")
 
-	if !e {
-		return errors.New("type mismatch")
-	}
 
 	t.streams <- conn
 	return nil
@@ -226,17 +237,20 @@ func (t *NatTransport) streamListener(conn net.Conn) {
 	}
 
 
+	
 
 	mux := ms.NewMultistreamMuxer()
+
 	mux.AddHandler(packet_proto, t.handlePacket)
 	mux.AddHandler(stream_proto, t.handleStream)
 
-	
 
 
 	
 	for {
 
+
+	
 
 		stream, err := session.Accept()
 

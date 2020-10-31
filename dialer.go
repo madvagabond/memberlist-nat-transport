@@ -1,5 +1,4 @@
-package memberlist_nat_transport
-
+package nat_transport
 
 import (
 	"sync"
@@ -58,6 +57,7 @@ func ctx_helper(ctx context.Context, f func() (net.Conn, error)) (net.Conn, erro
 	select {
 	case <- ctx.Done():
 		var c net.Conn
+		c = nil
 		return c, ctx.Err()  
 
 	case result := <- c:
@@ -74,6 +74,7 @@ func dialTransport(addr string) (*yamux.Session, error) {
 	conn, e := utp.Dial(addr)
 
 	if e != nil {
+		conn.Close()
 		return nil, e
 	}
 
@@ -90,15 +91,17 @@ func (d *dialer) dial(addr string) (net.Conn, error) {
 	}
 
 
+
 	session, e := dialTransport(addr)
 	
 	if e != nil {
 		return nil, e
 	}
 
+	
 
 	d.mu.Lock()
-
+	
 	d.conns[addr] = session
 	d.mu.Unlock()
 
